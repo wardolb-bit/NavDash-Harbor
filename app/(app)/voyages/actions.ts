@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getCurrentProfile } from "@/lib/profile";
 import { requireRole } from "@/lib/rbac";
+import { parseRouteWaypoints } from "@/lib/route-parser";
 import type { HazardPriority, HazardStatus, RouteFileType, Voyage, VoyagePhase, VoyageStatus } from "@/lib/types";
 
 const statusValues: VoyageStatus[] = ["Draft", "Active", "Complete"];
@@ -168,71 +169,6 @@ export async function deleteVoyage(voyageId: string) {
   redirect("/voyages");
 }
 
-function parseCsvWaypoints(text: string) {
-  const rows = text
-    .split(/\r?\n/)
-    .map((line) => line.split(",").map((cell) => cell.trim()))
-    .filter((row) => row.some(Boolean));
-  const header = rows[0]?.map((cell) => cell.toLowerCase()) ?? [];
-  const hasHeader = header.some((cell) => ["lat", "latitude", "lon", "longitude", "name"].includes(cell));
-  const dataRows = hasHeader ? rows.slice(1) : rows;
-  const nameIndex = hasHeader ? header.findIndex((cell) => cell === "name" || cell === "waypoint") : 0;
-  const latIndex = hasHeader ? header.findIndex((cell) => cell === "lat" || cell === "latitude") : 1;
-  const lonIndex = hasHeader ? header.findIndex((cell) => cell === "lon" || cell === "longitude" || cell === "lng") : 2;
-
-  return dataRows.slice(0, 500).map((row, index) => ({
-    sequence: index + 1,
-    name: row[nameIndex] || `WP ${index + 1}`,
-    latitude: Number.isFinite(Number(row[latIndex])) ? Number(row[latIndex]) : null,
-    longitude: Number.isFinite(Number(row[lonIndex])) ? Number(row[lonIndex]) : null,
-    remarks: null,
-  }));
-}
-
-function readAttribute(fragment: string, attr: string) {
-  const marker = `${attr}=`;
-  const start = fragment.indexOf(marker);
-
-  if (start < 0) {
-    return null;
-  }
-
-  const quote = fragment[start + marker.length];
-  const valueStart = start + marker.length + 1;
-  const valueEnd = fragment.indexOf(quote, valueStart);
-  return valueEnd > valueStart ? fragment.slice(valueStart, valueEnd) : null;
-}
-
-function parseXmlWaypoints(text: string) {
-  return text
-    .split("<")
-    .filter((fragment) => fragment.includes("wpt") || fragment.includes("waypoint") || fragment.includes("position"))
-    .slice(0, 500)
-    .map((fragment, index) => {
-      const nameStart = fragment.indexOf("<name>");
-      const nameEnd = fragment.indexOf("</name>");
-      const name = nameStart >= 0 && nameEnd > nameStart ? fragment.slice(nameStart + 6, nameEnd).trim() : `WP ${index + 1}`;
-      const lat = readAttribute(fragment, "lat") ?? readAttribute(fragment, "latitude");
-      const lon = readAttribute(fragment, "lon") ?? readAttribute(fragment, "longitude");
-
-      return {
-        sequence: index + 1,
-        name,
-        latitude: Number.isFinite(Number(lat)) ? Number(lat) : null,
-        longitude: Number.isFinite(Number(lon)) ? Number(lon) : null,
-        remarks: null,
-      };
-    });
-}
-
-function parseWaypoints(text: string, fileType: RouteFileType) {
-  if (fileType === "CSV") {
-    return parseCsvWaypoints(text);
-  }
-
-  return parseXmlWaypoints(text);
-}
-
 export async function uploadRouteFile(voyageId: string, formData: FormData) {
   await requireRole(["admin", "deck"]);
   const profile = await getCurrentProfile();
@@ -271,7 +207,7 @@ export async function uploadRouteFile(voyageId: string, formData: FormData) {
   }
 
   const text = await file.text();
-  const waypoints = parseWaypoints(text, fileType).map((waypoint) => ({
+  const waypoints = parseRouteWaypoints(text, fileType).map((waypoint) => ({
     ...waypoint,
     voyage_id: voyageId,
     route_file_id: routeFile.id,
