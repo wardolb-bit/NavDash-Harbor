@@ -922,3 +922,44 @@ begin
     with check (public.current_user_role() = 'deck');
   end if;
 end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'voyage_assignments'
+      and policyname = 'Voyage creators can assign themselves'
+  ) then
+    create policy "Voyage creators can assign themselves"
+    on public.voyage_assignments for insert
+    to authenticated
+    with check (
+      user_id = auth.uid()
+      and exists (
+        select 1
+        from public.voyages
+        where voyages.id = voyage_assignments.voyage_id
+          and voyages.created_by = auth.uid()
+      )
+    );
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'voyages'
+      and policyname = 'Voyage creators can update voyages'
+  ) then
+    create policy "Voyage creators can update voyages"
+    on public.voyages for update
+    to authenticated
+    using (created_by = auth.uid())
+    with check (created_by = auth.uid());
+  end if;
+end $$;

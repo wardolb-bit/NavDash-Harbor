@@ -5,10 +5,13 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getCurrentProfile } from "@/lib/profile";
 import { requireRole } from "@/lib/rbac";
-import type { VoyagePhase, VoyageStatus } from "@/lib/types";
+import type { HazardPriority, HazardStatus, RouteFileType, Voyage, VoyagePhase, VoyageStatus } from "@/lib/types";
 
 const statusValues: VoyageStatus[] = ["Draft", "Active", "Complete"];
 const phaseValues: VoyagePhase[] = ["Planning", "Pre-Departure", "Underway", "Pre-Arrival", "Complete"];
+const routeFileTypes: RouteFileType[] = ["RTZ", "XML", "CSV", "GPX", "KML"];
+const hazardPriorities: HazardPriority[] = ["Routine", "Important", "Urgent", "Safety Critical"];
+const hazardStatuses: HazardStatus[] = ["Active", "Monitoring", "Resolved"];
 
 function clean(value: FormDataEntryValue | null) {
   const text = String(value ?? "").trim();
@@ -20,6 +23,11 @@ function cleanDate(value: FormDataEntryValue | null) {
   return text ? new Date(text).toISOString() : null;
 }
 
+function fileExtension(fileName: string) {
+  const parts = fileName.split(".");
+  return parts.length > 1 ? parts[parts.length - 1].toUpperCase() : "";
+}
+
 function asStatus(value: FormDataEntryValue | null): VoyageStatus {
   const text = String(value ?? "Draft");
   return statusValues.includes(text as VoyageStatus) ? (text as VoyageStatus) : "Draft";
@@ -28,6 +36,21 @@ function asStatus(value: FormDataEntryValue | null): VoyageStatus {
 function asPhase(value: FormDataEntryValue | null): VoyagePhase {
   const text = String(value ?? "Planning");
   return phaseValues.includes(text as VoyagePhase) ? (text as VoyagePhase) : "Planning";
+}
+
+function asRouteFileType(fileName: string): RouteFileType | null {
+  const extension = fileExtension(fileName);
+  return routeFileTypes.includes(extension as RouteFileType) ? (extension as RouteFileType) : null;
+}
+
+function asHazardPriority(value: FormDataEntryValue | null): HazardPriority {
+  const text = String(value ?? "Routine");
+  return hazardPriorities.includes(text as HazardPriority) ? (text as HazardPriority) : "Routine";
+}
+
+function asHazardStatus(value: FormDataEntryValue | null): HazardStatus {
+  const text = String(value ?? "Active");
+  return hazardStatuses.includes(text as HazardStatus) ? (text as HazardStatus) : "Active";
 }
 
 function voyageNumber() {
@@ -55,7 +78,7 @@ export async function createVoyage(formData: FormData) {
 
   const vesselName = clean(formData.get("vessel_id")) ?? title;
   const supabase = await createClient();
-  const { error } = await (supabase.from("voyages") as any).insert({
+  const { data, error } = await (supabase.from("voyages") as any).insert({
     voyage_number: voyageNumber(),
     vessel_name: vesselName,
     title,
@@ -67,10 +90,18 @@ export async function createVoyage(formData: FormData) {
     phase: asPhase(formData.get("phase")),
     created_by: profile.id,
     updated_by: profile.id,
-  });
+  }).select("id").single();
 
   if (error) {
     redirect(`/voyages/new?error=${encodeURIComponent(error.message)}`);
+  }
+
+  if (data?.id) {
+    await (supabase.from("voyage_assignments") as any).insert({
+      voyage_id: data.id,
+      user_id: profile.id,
+      role: profile.role,
+    });
   }
 
   revalidatePath("/voyages");
@@ -135,4 +166,291 @@ export async function deleteVoyage(voyageId: string) {
 
   revalidatePath("/voyages");
   redirect("/voyages");
+}
+
+function parseCsvWaypoints(text: string) {
+  const rows = text
+    .split(/\r?\n/)
+    .map((line) => line.split(",").map((cell) => cell.trim()))
+    .filter((row) => row.some(Boolean));
+  const header = rows[0]?.map((cell) => cell.toLowerCase()) ?? [];
+  const hasHeader = header.some((cell) => ["lat", "latitude", "lon", "longitude", "name"].includes(cell));
+  const dataRows = hasHeader ? rows.slice(1) : rows;
+  const nameIndex = hasHeader ? header.findIndex((cell) => cell === "name" || cell === "waypoint") : 0;
+  const latIndex = hasHeader ? header.findIndex((cell) => cell === "lat" || cell === "latitude") : 1;
+  const lonIndex = hasHeader ? header.findIndex((cell) => cell === "lon" || cell === "longitude" || cell === "lng") : 2;
+
+  return dataRows.slice(0, 500).map((row, index) => ({
+    sequence: index + 1,
+    name: row[nameIndex] || `WP ${index + 1}`,
+    latitude: Number.isFinite(Number(row[latIndex])) ? Number(row[latIndex]) : null,
+    longitude: Number.isFinite(Number(row[lonIndex])) ? Number(row[lonIndex]) : null,
+    remarks: null,
+  }));
+}
+
+function readAttribute(fragment: string, attr: string) {
+  const marker = `${attr}=`;
+  const start = fragment.indexOf(marker);
+
+  if (start < 0) {
+    return null;
+  }
+
+  const quote = fragment[start + marker.length];
+  const valueStart = start + marker.length + 1;
+  const valueEnd = fragment.indexOf(quote, valueStart);
+  return valueEnd > valueStart ? fragment.slice(valueStart, valueEnd) : null;
+}
+
+function parseXmlWaypoints(text: string) {
+  return text
+    .split("<")
+    .filter((fragment) => fragment.includes("wpt") || fragment.includes("waypoint") || fragment.includes("position"))
+    .slice(0, 500)
+    .map((fragment, index) => {
+      const nameStart = fragment.indexOf("<name>");
+      const nameEnd = fragment.indexOf("</name>");
+      const name = nameStart >= 0 && nameEnd > nameStart ? fragment.slice(nameStart + 6, nameEnd).trim() : `WP ${index + 1}`;
+      const lat = readAttribute(fragment, "lat") ?? readAttribute(fragment, "latitude");
+      const lon = readAttribute(fragment, "lon") ?? readAttribute(fragment, "longitude");
+
+      return {
+        sequence: index + 1,
+        name,
+        latitude: Number.isFinite(Number(lat)) ? Number(lat) : null,
+        longitude: Number.isFinite(Number(lon)) ? Number(lon) : null,
+        remarks: null,
+      };
+    });
+}
+
+function parseWaypoints(text: string, fileType: RouteFileType) {
+  if (fileType === "CSV") {
+    return parseCsvWaypoints(text);
+  }
+
+  return parseXmlWaypoints(text);
+}
+
+export async function uploadRouteFile(voyageId: string, formData: FormData) {
+  await requireRole(["admin", "deck"]);
+  const profile = await getCurrentProfile();
+  const file = formData.get("route_file");
+
+  if (!(file instanceof File) || file.size === 0) {
+    redirect(`/voyages/${voyageId}?tab=route&error=missing-route-file`);
+  }
+
+  const fileType = asRouteFileType(file.name);
+
+  if (!fileType) {
+    redirect(`/voyages/${voyageId}?tab=route&error=unsupported-route-file`);
+  }
+
+  const supabase = await createClient();
+  const storagePath = `${voyageId}/route/${Date.now()}-${file.name}`;
+  const { error: uploadError } = await supabase.storage.from("voyages").upload(storagePath, file, { upsert: true });
+
+  if (uploadError) {
+    redirect(`/voyages/${voyageId}?tab=route&error=${encodeURIComponent(uploadError.message)}`);
+  }
+
+  await (supabase.from("voyage_route_files") as any).update({ is_current: false, replaced_at: new Date().toISOString() }).eq("voyage_id", voyageId);
+  const { data: routeFile, error: routeError } = await (supabase.from("voyage_route_files") as any).insert({
+    voyage_id: voyageId,
+    file_name: file.name,
+    file_type: fileType,
+    storage_path: storagePath,
+    uploaded_by: profile.id,
+    is_current: true,
+  }).select("id").single();
+
+  if (routeError) {
+    redirect(`/voyages/${voyageId}?tab=route&error=${encodeURIComponent(routeError.message)}`);
+  }
+
+  const text = await file.text();
+  const waypoints = parseWaypoints(text, fileType).map((waypoint) => ({
+    ...waypoint,
+    voyage_id: voyageId,
+    route_file_id: routeFile.id,
+  }));
+
+  await (supabase.from("voyage_waypoints") as any).delete().eq("voyage_id", voyageId);
+
+  if (waypoints.length > 0) {
+    const { error: waypointError } = await (supabase.from("voyage_waypoints") as any).insert(waypoints);
+
+    if (waypointError) {
+      redirect(`/voyages/${voyageId}?tab=route&error=${encodeURIComponent(waypointError.message)}`);
+    }
+  }
+
+  revalidatePath(`/voyages/${voyageId}`);
+  redirect(`/voyages/${voyageId}?tab=route`);
+}
+
+export async function saveWeather(voyageId: string, formData: FormData) {
+  await requireRole(["admin", "deck"]);
+  const profile = await getCurrentProfile();
+  const supabase = await createClient();
+  const { error } = await (supabase.from("voyage_weather") as any).upsert({
+    voyage_id: voyageId,
+    summary: clean(formData.get("summary")) ?? "",
+    source_reference: clean(formData.get("source_reference")),
+    updated_by: profile.id,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: "voyage_id" });
+
+  if (error) {
+    redirect(`/voyages/${voyageId}?tab=weather&error=${encodeURIComponent(error.message)}`);
+  }
+
+  revalidatePath(`/voyages/${voyageId}`);
+  redirect(`/voyages/${voyageId}?tab=weather`);
+}
+
+export async function createHazard(voyageId: string, formData: FormData) {
+  await requireRole(["admin", "deck"]);
+  const profile = await getCurrentProfile();
+  const title = clean(formData.get("title"));
+
+  if (!title) {
+    redirect(`/voyages/${voyageId}?tab=hazards&error=missing-hazard-title`);
+  }
+
+  const supabase = await createClient();
+  const { error } = await (supabase.from("voyage_hazards") as any).insert({
+    voyage_id: voyageId,
+    title,
+    location: clean(formData.get("location")),
+    description: clean(formData.get("description")),
+    priority: asHazardPriority(formData.get("priority")),
+    status: asHazardStatus(formData.get("status")),
+    source_reference: clean(formData.get("source_reference")),
+    created_by: profile.id,
+    updated_by: profile.id,
+  });
+
+  if (error) {
+    redirect(`/voyages/${voyageId}?tab=hazards&error=${encodeURIComponent(error.message)}`);
+  }
+
+  revalidatePath(`/voyages/${voyageId}`);
+  redirect(`/voyages/${voyageId}?tab=hazards`);
+}
+
+export async function uploadVoyageDocument(voyageId: string, formData: FormData) {
+  await requireRole(["admin", "deck"]);
+  const profile = await getCurrentProfile();
+  const title = clean(formData.get("title"));
+  const file = formData.get("document_file");
+
+  if (!title || !(file instanceof File) || file.size === 0) {
+    redirect(`/voyages/${voyageId}?tab=documents&error=missing-document`);
+  }
+
+  const supabase = await createClient();
+  const storagePath = `${voyageId}/documents/${Date.now()}-${file.name}`;
+  const { error: uploadError } = await supabase.storage.from("voyages").upload(storagePath, file, { upsert: true });
+
+  if (uploadError) {
+    redirect(`/voyages/${voyageId}?tab=documents&error=${encodeURIComponent(uploadError.message)}`);
+  }
+
+  const { error } = await (supabase.from("voyage_documents") as any).insert({
+    voyage_id: voyageId,
+    title,
+    file_name: file.name,
+    storage_path: storagePath,
+    uploaded_by: profile.id,
+    tags: [],
+  });
+
+  if (error) {
+    redirect(`/voyages/${voyageId}?tab=documents&error=${encodeURIComponent(error.message)}`);
+  }
+
+  revalidatePath(`/voyages/${voyageId}`);
+  redirect(`/voyages/${voyageId}?tab=documents`);
+}
+
+function pdfEscape(value: string) {
+  return value.replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
+}
+
+function simplePdf(lines: string[]) {
+  const body = lines.map((line, index) => `BT /F1 12 Tf 72 ${740 - index * 20} Td (${pdfEscape(line)}) Tj ET`).join("\n");
+  const objects = [
+    "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+    "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+    "3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >> endobj",
+    "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+    `5 0 obj << /Length ${body.length} >> stream\n${body}\nendstream endobj`,
+  ];
+  let output = "%PDF-1.4\n";
+  const offsets = [0];
+
+  for (const object of objects) {
+    offsets.push(output.length);
+    output += `${object}\n`;
+  }
+
+  const xrefStart = output.length;
+  output += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  output += offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  output += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  return new Blob([output], { type: "application/pdf" });
+}
+
+export async function generateVoyageBrief(voyageId: string) {
+  await requireRole(["admin", "deck"]);
+  const profile = await getCurrentProfile();
+  const supabase = await createClient();
+  const { data, error: voyageError } = await supabase.from("voyages").select("*").eq("id", voyageId).maybeSingle();
+  const voyage = data as Voyage | null;
+
+  if (voyageError || !voyage) {
+    redirect(`/voyages/${voyageId}?tab=reports&error=${encodeURIComponent(voyageError?.message ?? "Voyage not found")}`);
+  }
+
+  const pdf = simplePdf([
+    "NavDash Harbor Voyage Brief",
+    `Name: ${voyage.title}`,
+    `Vessel: ${voyage.vessel_name}`,
+    `Departure: ${voyage.origin ?? "Not set"}`,
+    `Arrival: ${voyage.destination ?? "Not set"}`,
+    `Status: ${voyage.status}`,
+    `Phase: ${voyage.phase}`,
+    `ETD: ${voyage.etd ?? "Not set"}`,
+    `ETA: ${voyage.eta ?? "Not set"}`,
+  ]);
+  const fileName = "voyage-brief.pdf";
+  const storagePath = `${voyageId}/reports/${fileName}`;
+  const { error: uploadError } = await supabase.storage.from("voyages").upload(storagePath, pdf, {
+    contentType: "application/pdf",
+    upsert: true,
+  });
+
+  if (uploadError) {
+    redirect(`/voyages/${voyageId}?tab=reports&error=${encodeURIComponent(uploadError.message)}`);
+  }
+
+  await (supabase.from("voyage_reports") as any).update({ is_current: false }).eq("voyage_id", voyageId);
+  const { error } = await (supabase.from("voyage_reports") as any).insert({
+    voyage_id: voyageId,
+    report_type: "Voyage Brief PDF",
+    file_name: fileName,
+    storage_path: storagePath,
+    generated_by: profile.id,
+    is_current: true,
+  });
+
+  if (error) {
+    redirect(`/voyages/${voyageId}?tab=reports&error=${encodeURIComponent(error.message)}`);
+  }
+
+  revalidatePath(`/voyages/${voyageId}`);
+  redirect(`/voyages/${voyageId}?tab=reports`);
 }

@@ -1,9 +1,17 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, FileText, Ship, Trash2 } from "lucide-react";
+import { ArrowLeft, FileText, Upload, Ship, Trash2 } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { getCurrentProfile } from "@/lib/profile";
-import { deleteVoyage, updateVoyage } from "../actions";
+import {
+  createHazard,
+  deleteVoyage,
+  generateVoyageBrief,
+  saveWeather,
+  updateVoyage,
+  uploadRouteFile,
+  uploadVoyageDocument,
+} from "../actions";
 import type {
   Voyage,
   VoyageDocument,
@@ -187,7 +195,7 @@ export default async function VoyageDetailPage({
           </aside>
         </section>
       ) : (
-        <VoyageTabContent voyageId={voyage.id} tab={activeTab} />
+        <VoyageTabContent voyageId={voyage.id} tab={activeTab} canEdit={canEdit} />
       )}
     </div>
   );
@@ -278,13 +286,16 @@ function SelectField<T extends string>({
 async function VoyageTabContent({
   voyageId,
   tab,
+  canEdit,
 }: {
   voyageId: string;
   tab: Exclude<(typeof tabs)[number], "Overview">;
+  canEdit: boolean;
 }) {
   const supabase = await createClient();
 
   if (tab === "Route") {
+    const uploadAction = uploadRouteFile.bind(null, voyageId);
     const [routeFilesResult, waypointsResult] = await Promise.all([
       supabase.from("voyage_route_files").select("id, file_name, file_type, uploaded_at, is_current").eq("voyage_id", voyageId).order("uploaded_at", { ascending: false }),
       supabase.from("voyage_waypoints").select("id, sequence, name, latitude, longitude, remarks").eq("voyage_id", voyageId).order("sequence", { ascending: true }),
@@ -300,11 +311,30 @@ async function VoyageTabContent({
 
     return (
       <section className="command-card p-6">
-        <h2 className="text-xl font-bold text-harbor-navy">Route</h2>
-        <p className="mt-1 text-sm text-slate-600">Route files and read-only parsed waypoints.</p>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-harbor-navy">Route</h2>
+            <p className="mt-1 text-sm text-slate-600">Route files and read-only parsed waypoints.</p>
+          </div>
+          {canEdit ? (
+            <form action={uploadAction} className="flex flex-wrap items-center gap-2">
+              <input
+                name="route_file"
+                type="file"
+                accept=".rtz,.xml,.csv,.gpx,.kml"
+                required
+                className="min-h-11 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700"
+              />
+              <button className="operational-button" type="submit">
+                <Upload className="h-4 w-4" aria-hidden />
+                Upload Route
+              </button>
+            </form>
+          ) : null}
+        </div>
         {(!routeFiles || routeFiles.length === 0) && (!waypoints || waypoints.length === 0) ? <TabEmpty label="route data" /> : null}
         {routeFiles && routeFiles.length > 0 ? (
-          <DataList title="Route Files" rows={routeFiles.map((file) => [file.file_name, file.file_type, file.is_current ? "Current" : "Replaced"])} />
+          <DataList title="Route Files" rows={routeFiles.map((file) => [file.file_name, file.file_type, file.is_current ? "Current" : "Replaced", formatDate(file.uploaded_at)])} />
         ) : null}
         {waypoints && waypoints.length > 0 ? (
           <DataList title="Waypoints" rows={waypoints.map((point) => [String(point.sequence), point.name ?? "Unnamed", `${point.latitude ?? ""}, ${point.longitude ?? ""}`, point.remarks ?? ""])} />
@@ -314,6 +344,7 @@ async function VoyageTabContent({
   }
 
   if (tab === "Weather") {
+    const weatherAction = saveWeather.bind(null, voyageId);
     const result = await supabase.from("voyage_weather").select("summary, source_reference, updated_at").eq("voyage_id", voyageId).maybeSingle();
     const data = result.data as Pick<VoyageWeather, "summary" | "source_reference" | "updated_at"> | null;
     const error = result.error;
@@ -323,43 +354,165 @@ async function VoyageTabContent({
     return (
       <section className="command-card p-6">
         <h2 className="text-xl font-bold text-harbor-navy">Weather</h2>
-        {data ? (
-          <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700">
-            <p>{data.summary || "No summary entered."}</p>
-            <p className="mt-4 font-bold text-slate-500">Source: {data.source_reference || "Not set"}</p>
-          </div>
-        ) : <TabEmpty label="weather summary" />}
+        {canEdit ? (
+          <form action={weatherAction} className="mt-5 space-y-4">
+            <label className="block">
+              <span className="text-sm font-bold text-slate-700">Weather Summary</span>
+              <textarea
+                name="summary"
+                defaultValue={data?.summary ?? ""}
+                rows={6}
+                className="mt-2 w-full rounded-md border border-slate-300 px-3 py-2 text-sm outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-bold text-slate-700">Source / Reference</span>
+              <input
+                name="source_reference"
+                defaultValue={data?.source_reference ?? ""}
+                className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <div className="flex justify-end">
+              <button className="operational-button" type="submit">Save Weather</button>
+            </div>
+          </form>
+        ) : data ? (
+          <WeatherSummary summary={data.summary} source={data.source_reference} />
+        ) : (
+          <TabEmpty label="weather summary" />
+        )}
       </section>
     );
   }
 
   if (tab === "Hazards") {
-    const result = await supabase.from("voyage_hazards").select("title, location, priority, status, source_reference").eq("voyage_id", voyageId).order("created_at", { ascending: false });
-    const data = result.data as Pick<VoyageHazard, "title" | "location" | "priority" | "status" | "source_reference">[] | null;
+    const hazardAction = createHazard.bind(null, voyageId);
+    const result = await supabase.from("voyage_hazards").select("title, location, description, priority, status, source_reference").eq("voyage_id", voyageId).order("created_at", { ascending: false });
+    const data = result.data as Pick<VoyageHazard, "title" | "location" | "description" | "priority" | "status" | "source_reference">[] | null;
     const error = result.error;
     if (error) {
       return <VoyageError title="Hazards could not load" message="Supabase returned an error while loading hazards." details={error.message} />;
     }
-    return <TabTable title="Hazards" emptyLabel="hazards" rows={(data ?? []).map((hazard) => [hazard.title, hazard.location ?? "Not set", hazard.priority, hazard.status, hazard.source_reference ?? "Not set"])} />;
+    return (
+      <section className="space-y-6">
+        {canEdit ? <HazardForm action={hazardAction} /> : null}
+        <TabTable
+          title="Hazards"
+          emptyLabel="hazards"
+          rows={(data ?? []).map((hazard) => [hazard.title, hazard.location ?? "Not set", hazard.priority, hazard.status, hazard.source_reference ?? "Not set", hazard.description ?? ""])}
+        />
+      </section>
+    );
   }
 
   if (tab === "Documents") {
+    const documentAction = uploadVoyageDocument.bind(null, voyageId);
     const result = await supabase.from("voyage_documents").select("title, file_name, uploaded_at").eq("voyage_id", voyageId).order("uploaded_at", { ascending: false });
     const data = result.data as Pick<VoyageDocument, "title" | "file_name" | "uploaded_at">[] | null;
     const error = result.error;
     if (error) {
       return <VoyageError title="Documents could not load" message="Supabase returned an error while loading documents." details={error.message} />;
     }
-    return <TabTable title="Documents" emptyLabel="documents" rows={(data ?? []).map((document) => [document.title, document.file_name, formatDate(document.uploaded_at)])} />;
+    return (
+      <section className="space-y-6">
+        {canEdit ? (
+          <form action={documentAction} className="command-card p-6">
+            <h2 className="text-xl font-bold text-harbor-navy">Upload Voyage Document</h2>
+            <div className="mt-5 grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
+              <label className="block">
+                <span className="text-sm font-bold text-slate-700">Title</span>
+                <input name="title" required className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100" />
+              </label>
+              <label className="block">
+                <span className="text-sm font-bold text-slate-700">File</span>
+                <input name="document_file" type="file" required className="mt-2 min-h-11 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700" />
+              </label>
+              <button className="operational-button" type="submit">Upload</button>
+            </div>
+          </form>
+        ) : null}
+        <TabTable title="Documents" emptyLabel="documents" rows={(data ?? []).map((document) => [document.title, document.file_name, formatDate(document.uploaded_at)])} />
+      </section>
+    );
   }
 
+  const reportAction = generateVoyageBrief.bind(null, voyageId);
   const result = await supabase.from("voyage_reports").select("report_type, file_name, generated_at, is_current").eq("voyage_id", voyageId).order("generated_at", { ascending: false });
   const data = result.data as Pick<VoyageReport, "report_type" | "file_name" | "generated_at" | "is_current">[] | null;
   const error = result.error;
   if (error) {
     return <VoyageError title="Reports could not load" message="Supabase returned an error while loading reports." details={error.message} />;
   }
-  return <TabTable title="Reports" emptyLabel="reports" rows={(data ?? []).map((report) => [report.report_type, report.file_name, formatDate(report.generated_at), report.is_current ? "Current" : "Replaced"])} />;
+  return (
+    <section className="space-y-6">
+      {canEdit ? (
+        <form action={reportAction} className="command-card flex flex-wrap items-center justify-between gap-4 p-6">
+          <div>
+            <h2 className="text-xl font-bold text-harbor-navy">Voyage Brief PDF</h2>
+            <p className="mt-1 text-sm text-slate-600">Generate and replace the current voyage brief in the voyage folder.</p>
+          </div>
+          <button className="operational-button" type="submit">Generate Brief</button>
+        </form>
+      ) : null}
+      <TabTable title="Reports" emptyLabel="reports" rows={(data ?? []).map((report) => [report.report_type, report.file_name, formatDate(report.generated_at), report.is_current ? "Current" : "Replaced"])} />
+    </section>
+  );
+}
+
+function WeatherSummary({ summary, source }: { summary: string; source: string | null }) {
+  return (
+    <div className="mt-4 rounded-md border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700">
+      <p>{summary || "No summary entered."}</p>
+      <p className="mt-4 font-bold text-slate-500">Source: {source || "Not set"}</p>
+    </div>
+  );
+}
+
+function HazardForm({ action }: { action: (formData: FormData) => void }) {
+  return (
+    <form action={action} className="command-card p-6">
+      <h2 className="text-xl font-bold text-harbor-navy">Add Hazard</h2>
+      <div className="mt-5 grid gap-4 md:grid-cols-2">
+        <label className="block">
+          <span className="text-sm font-bold text-slate-700">Title</span>
+          <input name="title" required className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100" />
+        </label>
+        <label className="block">
+          <span className="text-sm font-bold text-slate-700">Location</span>
+          <input name="location" className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100" />
+        </label>
+        <label className="block">
+          <span className="text-sm font-bold text-slate-700">Priority</span>
+          <select name="priority" defaultValue="Routine" className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100">
+            <option>Routine</option>
+            <option>Important</option>
+            <option>Urgent</option>
+            <option>Safety Critical</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="text-sm font-bold text-slate-700">Status</span>
+          <select name="status" defaultValue="Active" className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100">
+            <option>Active</option>
+            <option>Monitoring</option>
+            <option>Resolved</option>
+          </select>
+        </label>
+        <label className="block md:col-span-2">
+          <span className="text-sm font-bold text-slate-700">Source Reference</span>
+          <input name="source_reference" className="mt-2 min-h-11 w-full rounded-md border border-slate-300 px-3 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100" />
+        </label>
+        <label className="block md:col-span-2">
+          <span className="text-sm font-bold text-slate-700">Description</span>
+          <textarea name="description" rows={4} className="mt-2 w-full rounded-md border border-slate-300 px-3 py-2 outline-none focus:border-harbor-cyan focus:ring-2 focus:ring-cyan-100" />
+        </label>
+      </div>
+      <div className="mt-5 flex justify-end">
+        <button className="operational-button" type="submit">Add Hazard</button>
+      </div>
+    </form>
+  );
 }
 
 function TabEmpty({ label }: { label: string }) {
