@@ -52,7 +52,11 @@ export function LoginForm() {
         </div>
       ) : null}
 
-      <button className="operational-button w-full" disabled={pending}>
+      <button
+        type="submit"
+        className="flex min-h-12 w-full items-center justify-center gap-2 rounded-md border border-cyan-700 bg-cyan-700 px-4 py-3 text-sm font-bold text-white shadow-sm transition hover:bg-cyan-800 disabled:cursor-not-allowed disabled:opacity-60"
+        disabled={pending}
+      >
         <LogIn className="h-4 w-4" aria-hidden />
         {pending ? "Checking access" : "Sign In"}
       </button>
