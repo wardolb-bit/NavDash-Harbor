@@ -21,7 +21,11 @@ export function SetupForm() {
           {state.technical && <p className="mt-1 text-xs opacity-70">{state.technical}</p>}
         </div>
       )}
-      <button className="operational-button w-full" disabled={pending}>
+      <button
+        type="submit"
+        className="flex min-h-12 w-full items-center justify-center rounded-md border border-cyan-700 bg-cyan-700 px-4 py-3 text-sm font-bold text-white shadow-sm transition hover:bg-cyan-800 disabled:cursor-not-allowed disabled:opacity-60"
+        disabled={pending}
+      >
         {pending ? "Commissioning Harbor…" : "Create Harbor owner account"}
       </button>
     </form>
